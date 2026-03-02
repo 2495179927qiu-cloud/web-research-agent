@@ -1,0 +1,17 @@
+{
+  "name": "web-research-agent",
+  "version": "1.0.0",
+  "description": "A CLI agent that can search the web and answer with sources.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "dotenv": "^17.3.1"
+  }
+}
