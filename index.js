@@ -34,6 +34,9 @@ const MAX_HISTORY_MESSAGES = 24;
 const WEB_TIMEOUT_MS = Number(process.env.WEB_TIMEOUT_MS || 15000);
 const MODEL_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
 const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES || 2);
+const DEFAULT_SHOW_PROCESS = /^(1|true|yes|on)$/i.test(
+  String(process.env.SHOW_AGENT_PROCESS || "").trim(),
+);
 
 if (!process.env.OPENAI_API_KEY) {
   console.error("Missing OPENAI_API_KEY. Add it in .env then retry.");
@@ -309,6 +312,51 @@ function safeParseJson(jsonText) {
   }
 }
 
+function createProcessReporter(enabled) {
+  let eventIndex = 0;
+
+  return {
+    enabled: Boolean(enabled),
+    log(title, details = []) {
+      if (!enabled) {
+        return;
+      }
+
+      eventIndex += 1;
+      const idx = String(eventIndex).padStart(2, "0");
+      console.log(`\n[过程 ${idx}] ${title}`);
+      for (const line of details) {
+        console.log(`  - ${line}`);
+      }
+    },
+  };
+}
+
+function summarizeSearchResult(result) {
+  const lines = [];
+  const count = Number(result?.results_count || 0);
+  const engine = String(result?.engine || "unknown");
+  lines.push(`搜索引擎: ${engine}`);
+  lines.push(`命中数量: ${count}`);
+
+  const top = Array.isArray(result?.results) ? result.results.slice(0, 3) : [];
+  for (let i = 0; i < top.length; i += 1) {
+    const item = top[i];
+    lines.push(`${i + 1}. ${clipText(item?.title || "(无标题)", 70)} | ${item?.url || ""}`);
+  }
+  return lines;
+}
+
+function summarizeFetchResult(result) {
+  const textLen = String(result?.text || "").length;
+  return [
+    `URL: ${result?.url || ""}`,
+    `标题: ${clipText(result?.title || "(无标题)", 90)}`,
+    `正文长度: ${textLen} 字符`,
+    `抓取方式: ${result?.method || "unknown"}`,
+  ];
+}
+
 function getCallName(call) {
   return call.name || call.function?.name || "";
 }
@@ -317,7 +365,7 @@ function getCallArgs(call) {
   return call.arguments || call.function?.arguments || "{}";
 }
 
-async function runToolCall(toolCall) {
+async function runToolCall(toolCall, reporter) {
   const toolName = getCallName(toolCall);
   const handler = TOOL_HANDLERS[toolName];
 
@@ -329,12 +377,20 @@ async function runToolCall(toolCall) {
   }
 
   const args = safeParseJson(getCallArgs(toolCall));
-  console.log(`[tool] ${toolName} ${JSON.stringify(args)}`);
+  reporter?.log(`调用工具: ${toolName}`, [JSON.stringify(args)]);
 
   try {
     const result = await handler(args);
+    if (toolName === "search_web") {
+      reporter?.log(`工具完成: ${toolName}`, summarizeSearchResult(result));
+    } else if (toolName === "fetch_page") {
+      reporter?.log(`工具完成: ${toolName}`, summarizeFetchResult(result));
+    } else {
+      reporter?.log(`工具完成: ${toolName}`);
+    }
     return { ok: true, result };
   } catch (error) {
+    reporter?.log(`工具失败: ${toolName}`, [error.message || String(error)]);
     return { ok: false, error: error.message || String(error) };
   }
 }
@@ -344,6 +400,33 @@ function trimHistory(messages) {
     return messages;
   }
   return messages.slice(messages.length - MAX_HISTORY_MESSAGES);
+}
+
+function parseCliArgs(argv) {
+  const questionParts = [];
+  let showProcess = DEFAULT_SHOW_PROCESS;
+
+  for (const rawArg of argv) {
+    const arg = String(rawArg || "").trim();
+    if (!arg) {
+      continue;
+    }
+
+    if (arg === "--show-process") {
+      showProcess = true;
+      continue;
+    }
+    if (arg === "--hide-process") {
+      showProcess = false;
+      continue;
+    }
+    questionParts.push(rawArg);
+  }
+
+  return {
+    question: questionParts.join(" ").trim(),
+    showProcess,
+  };
 }
 
 function modelRequestHeaders() {
@@ -398,12 +481,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function callResponsesApi(payload) {
+async function callResponsesApi(payload, reporter, stageLabel = "模型请求") {
   const endpoint = `${API_BASE_URL.replace(/\/+$/, "")}/responses`;
   let lastError;
 
   for (let attempt = 0; attempt <= OPENAI_MAX_RETRIES; attempt += 1) {
+    const attemptIndex = attempt + 1;
+    const maxAttempts = OPENAI_MAX_RETRIES + 1;
     try {
+      reporter?.log(`${stageLabel} (尝试 ${attemptIndex}/${maxAttempts})`, [
+        `模型: ${payload?.model || ACTIVE_MODEL}`,
+      ]);
+
       const response = await fetchWithTimeout(
         endpoint,
         {
@@ -416,6 +505,7 @@ async function callResponsesApi(payload) {
 
       const raw = await response.text();
       if (!response.ok) {
+        reporter?.log(`${stageLabel} 失败`, [`HTTP ${response.status}`]);
         const error = new Error(`model request failed: HTTP ${response.status} ${parseApiError(raw)}`);
         if (isRetriableStatus(response.status) && attempt < OPENAI_MAX_RETRIES) {
           await sleep(1000 * (attempt + 1));
@@ -425,12 +515,14 @@ async function callResponsesApi(payload) {
       }
 
       try {
+        reporter?.log(`${stageLabel} 成功`);
         return JSON.parse(raw);
       } catch {
         throw new Error(`model request failed: invalid JSON response (${clipText(raw, 200)})`);
       }
     } catch (error) {
       lastError = error;
+      reporter?.log(`${stageLabel} 异常`, [error.message || String(error)]);
       if (isRetriableNetworkError(error) && attempt < OPENAI_MAX_RETRIES) {
         await sleep(1000 * (attempt + 1));
         continue;
@@ -499,19 +591,23 @@ function formatToolOutputs(toolOutputs, maxChars = 50000) {
   return clipText(lines.join("\n"), maxChars);
 }
 
-async function synthesizeFromToolOutputs(userQuestion, toolOutputs) {
+async function synthesizeFromToolOutputs(userQuestion, toolOutputs, reporter) {
   const evidence = formatToolOutputs(toolOutputs);
-  const response = await callResponsesApi({
-    model: ACTIVE_MODEL,
-    input: [
-      { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `用户问题：${userQuestion}\n\n以下是工具返回的检索资料（JSON）：\n${evidence}\n\n请基于这些资料回答，并附上参考来源链接。`,
-      },
-    ],
-    temperature: 0.2,
-  });
+  const response = await callResponsesApi(
+    {
+      model: ACTIVE_MODEL,
+      input: [
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: `用户问题：${userQuestion}\n\n以下是工具返回的检索资料（JSON）：\n${evidence}\n\n请基于这些资料回答，并附上参考来源链接。`,
+        },
+      ],
+      temperature: 0.2,
+    },
+    reporter,
+    "回退合成回答",
+  );
 
   return extractAssistantText(response) || "没有生成可读答案。";
 }
@@ -554,7 +650,8 @@ async function ensureActiveModel() {
   console.log(`[model] OPENAI_MODEL unavailable; switched to ${ACTIVE_MODEL}`);
 }
 
-async function askAgent(userQuestion, history = []) {
+async function askAgent(userQuestion, history = [], options = {}) {
+  const reporter = createProcessReporter(Boolean(options.showProcess));
   const seedInput = [
     { role: "system", content: SYSTEM_PROMPT },
     ...history.map((message) => ({
@@ -564,17 +661,23 @@ async function askAgent(userQuestion, history = []) {
     { role: "user", content: userQuestion },
   ];
 
-  let modelResponse = await callResponsesApi({
-    model: ACTIVE_MODEL,
-    input: seedInput,
-    tools: TOOL_DEFINITIONS,
-    temperature: 0.2,
-  });
+  reporter.log("收到问题", [clipText(userQuestion, 120)]);
+  let modelResponse = await callResponsesApi(
+    {
+      model: ACTIVE_MODEL,
+      input: seedInput,
+      tools: TOOL_DEFINITIONS,
+      temperature: 0.2,
+    },
+    reporter,
+    "初始推理",
+  );
 
   for (let step = 1; step <= MAX_AGENT_STEPS; step += 1) {
     const calls = extractFunctionCalls(modelResponse);
     if (!calls.length) {
       const answer = extractAssistantText(modelResponse) || "没有生成可读答案。";
+      reporter.log("完成回答", [`答案长度: ${answer.length} 字符`]);
       return {
         answer,
         history: trimHistory([
@@ -589,9 +692,10 @@ async function askAgent(userQuestion, history = []) {
       throw new Error("model response missing id; cannot continue tool loop");
     }
 
+    reporter.log(`进入 Step ${step}`, [`工具调用数: ${calls.length}`]);
     const toolOutputs = [];
     for (const call of calls) {
-      const result = await runToolCall(call);
+      const result = await runToolCall(call, reporter);
       toolOutputs.push({
         type: "function_call_output",
         call_id: call.id,
@@ -600,15 +704,20 @@ async function askAgent(userQuestion, history = []) {
     }
 
     try {
-      modelResponse = await callResponsesApi({
-        model: ACTIVE_MODEL,
-        previous_response_id: modelResponse.id,
-        input: toolOutputs,
-        tools: TOOL_DEFINITIONS,
-        temperature: 0.2,
-      });
+      modelResponse = await callResponsesApi(
+        {
+          model: ACTIVE_MODEL,
+          previous_response_id: modelResponse.id,
+          input: toolOutputs,
+          tools: TOOL_DEFINITIONS,
+          temperature: 0.2,
+        },
+        reporter,
+        `Step ${step} 续推理`,
+      );
     } catch {
-      const answer = await synthesizeFromToolOutputs(userQuestion, toolOutputs);
+      reporter.log(`Step ${step} 续推理失败`, ["切换到回退合成回答"]);
+      const answer = await synthesizeFromToolOutputs(userQuestion, toolOutputs, reporter);
       return {
         answer,
         history: trimHistory([
@@ -623,14 +732,22 @@ async function askAgent(userQuestion, history = []) {
   throw new Error(`agent reached max steps (${MAX_AGENT_STEPS}). Increase MAX_AGENT_STEPS if needed.`);
 }
 
-async function runSingleQuestion(question) {
-  const { answer } = await askAgent(question, []);
+async function runSingleQuestion(question, options = {}) {
+  const { answer } = await askAgent(question, [], {
+    showProcess: Boolean(options.showProcess),
+  });
   console.log(answer);
 }
 
-async function runInteractive() {
+async function runInteractive(options = {}) {
+  let showProcess = Boolean(
+    options.showProcess !== undefined ? options.showProcess : DEFAULT_SHOW_PROCESS,
+  );
+
   console.log(`Web Research Agent running with model: ${ACTIVE_MODEL}`);
   console.log(`OpenAI base URL: ${API_BASE_URL}`);
+  console.log(`过程可视化: ${showProcess ? "开启" : "关闭"}`);
+  console.log("输入 /process on 或 /process off 可动态切换过程可视化。");
   console.log("输入问题开始对话；输入 exit / quit / 退出 结束。");
 
   let history = [];
@@ -648,8 +765,25 @@ async function runInteractive() {
         break;
       }
 
+      if (normalized === "/process") {
+        console.log(`\nAgent> 当前过程可视化: ${showProcess ? "开启" : "关闭"}`);
+        continue;
+      }
+
+      if (normalized === "/process on" || normalized === "/过程 开") {
+        showProcess = true;
+        console.log("\nAgent> 已开启过程可视化。");
+        continue;
+      }
+
+      if (normalized === "/process off" || normalized === "/过程 关") {
+        showProcess = false;
+        console.log("\nAgent> 已关闭过程可视化。");
+        continue;
+      }
+
       try {
-        const result = await askAgent(question, history);
+        const result = await askAgent(question, history, { showProcess });
         history = result.history;
         console.log(`\nAgent> ${result.answer}`);
       } catch (error) {
@@ -664,12 +798,12 @@ async function runInteractive() {
 async function main() {
   await ensureActiveModel();
 
-  const singleQuestion = process.argv.slice(2).join(" ").trim();
-  if (singleQuestion) {
-    await runSingleQuestion(singleQuestion);
+  const cli = parseCliArgs(process.argv.slice(2));
+  if (cli.question) {
+    await runSingleQuestion(cli.question, { showProcess: cli.showProcess });
     return;
   }
-  await runInteractive();
+  await runInteractive({ showProcess: cli.showProcess });
 }
 
 main().catch((error) => {

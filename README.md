@@ -7,6 +7,7 @@
 - 自动搜索网页（Bing HTML 结果页解析）
 - 自动抓取网页正文（直抓 + `r.jina.ai` 兜底）
 - OpenAI 兼容 `responses` + function-calling 循环，模型自己决定是否继续检索
+- 支持“过程可视化”开关（可显示 Agent 的分步检索与工具调用过程）
 - 支持单次提问和多轮对话
 
 ## 快速开始
@@ -49,12 +50,26 @@ npm start
 node index.js "今天英伟达股价最新是多少？"
 ```
 
+- 单次提问并显示检索过程：
+
+```bash
+node index.js --show-process "今天英伟达股价最新是多少？"
+```
+
+交互模式下可随时输入：
+
+```text
+/process on
+/process off
+```
+
 ## 环境变量
 
 - `OPENAI_API_KEY` 必填
 - `OPENAI_BASE_URL` 可选（默认直连 OpenAI；如使用兼容网关请配置）
 - `OPENAI_MODEL` 默认 `gpt-4.1-mini`
 - `OPENAI_MAX_RETRIES` 默认 `2`
+- `SHOW_AGENT_PROCESS` 默认 `false`（是否默认显示 Agent 过程）
 - `MAX_AGENT_STEPS` 默认 `6`
 - `SEARCH_RESULTS` 默认 `6`
 - `PAGE_MAX_CHARS` 默认 `12000`
