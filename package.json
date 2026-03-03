@@ -4,14 +4,18 @@
   "description": "A CLI agent that can search the web and answer with sources.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "start:mcp-server": "node mcp-server.js",
+    "start:mcp-agent": "node mcp-agent.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "cheerio": "^1.2.0",
-    "dotenv": "^17.3.1"
+    "dotenv": "^17.3.1",
+    "zod": "^4.1.11"
   }
 }
